@@ -1,0 +1,191 @@
+name: Auto-tag deploy
+
+# Reusable workflow that creates an annotated tag at a deployed SHA,
+# annotates the source PR (if discoverable), and applies a deployed:<env>
+# label. Called by per-repo wrappers — see operations/release/auto-tagging-spec.md
+# in gtg-all for the full spec.
+
+on:
+  workflow_call:
+    inputs:
+      env:
+        description: "Environment token (e.g. dev, staging, preview, prod). Wrapper is responsible for translation."
+        required: true
+        type: string
+      sha:
+        description: "Full SHA of the deployed commit."
+        required: true
+        type: string
+      run_number:
+        description: "github.run_number of the triggering deploy run. Used for tag uniqueness."
+        required: true
+        type: string
+      deploy_run_url:
+        description: "html_url of the triggering deploy run. Recorded in tag annotation."
+        required: false
+        type: string
+        default: ""
+      deploy_actor:
+        description: "github.actor of the deploy run. Recorded in tag annotation."
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: read
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout at deployed SHA
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.sha }}
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Compute tag name
+        id: name
+        env:
+          ENV: ${{ inputs.env }}
+          SHA: ${{ inputs.sha }}
+          RUN: ${{ inputs.run_number }}
+        run: |
+          set -euo pipefail
+          DATE=$(date -u +%Y.%m.%d)
+          SHORT=$(echo "$SHA" | cut -c1-7)
+          TAG="${ENV}-${DATE}-${RUN}-${SHORT}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "short=$SHORT" >> "$GITHUB_OUTPUT"
+          echo "date=$DATE" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve PR for SHA
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SHA: ${{ inputs.sha }}
+        run: |
+          set -euo pipefail
+          PR_NUM=$(gh pr list --search "$SHA" --state merged --json number --jq '.[0].number // empty' || echo "")
+          if [ -z "$PR_NUM" ]; then
+            echo "number=" >> "$GITHUB_OUTPUT"
+            echo "No PR found for $SHA — comment + label will be skipped."
+          else
+            echo "number=$PR_NUM" >> "$GITHUB_OUTPUT"
+            echo "Found PR #$PR_NUM"
+          fi
+
+      - name: Create and push annotated tag
+        env:
+          TAG: ${{ steps.name.outputs.tag }}
+          SHA: ${{ inputs.sha }}
+          ENV: ${{ inputs.env }}
+          REPO: ${{ github.repository }}
+          PR_NUM: ${{ steps.pr.outputs.number }}
+          RUN_URL: ${{ inputs.deploy_run_url }}
+          ACTOR: ${{ inputs.deploy_actor }}
+        run: |
+          set -euo pipefail
+          if git rev-parse --verify "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "::warning::Tag $TAG already exists — skipping."
+            exit 0
+          fi
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "::warning::Tag $TAG already exists on origin — skipping."
+            exit 0
+          fi
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          NOW=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          PR_LINE="(none)"
+          if [ -n "$PR_NUM" ]; then
+            PR_LINE="#$PR_NUM"
+          fi
+
+          MSG=$(printf 'Deploy: %s\nRepo:   %s\nCommit: %s\nPR:     %s\nRun:    %s\nBy:     %s\nAt:     %s\n' \
+            "$ENV" "$REPO" "$SHA" "$PR_LINE" "$RUN_URL" "$ACTOR" "$NOW")
+
+          git tag -a "$TAG" "$SHA" -m "$MSG"
+          git push origin "refs/tags/$TAG"
+          echo "Created tag $TAG at $SHA"
+
+      - name: Ensure deployed label exists
+        if: steps.pr.outputs.number != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ENV: ${{ inputs.env }}
+        run: |
+          set -euo pipefail
+          LABEL="deployed:${ENV}"
+          case "$ENV" in
+            dev)     COLOR="c5def5" ;;
+            staging) COLOR="fbca04" ;;
+            preview) COLOR="bfd4f2" ;;
+            prod)    COLOR="0e8a16" ;;
+            *)       COLOR="ededed" ;;
+          esac
+          if ! gh label list --json name --jq '.[].name' | grep -Fxq "$LABEL"; then
+            gh label create "$LABEL" --color "$COLOR" --description "Deployed to $ENV environment" || true
+          fi
+
+      - name: Apply label to PR
+        if: steps.pr.outputs.number != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUM: ${{ steps.pr.outputs.number }}
+          ENV: ${{ inputs.env }}
+        run: gh pr edit "$PR_NUM" --add-label "deployed:${ENV}"
+
+      - name: Upsert deploy-status comment on PR
+        if: steps.pr.outputs.number != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUM: ${{ steps.pr.outputs.number }}
+          ENV: ${{ inputs.env }}
+          TAG: ${{ steps.name.outputs.tag }}
+          SHORT: ${{ steps.name.outputs.short }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          MARKER='<!-- gtg-deploy-status -->'
+          NOW=$(date -u +"%Y-%m-%d %H:%M UTC")
+          NEW_ROW="| ${ENV} | \`${TAG}\` | ${SHORT} | ${NOW} |"
+
+          # Find existing marker comment on the PR
+          COMMENT_JSON=$(gh api "repos/${REPO}/issues/${PR_NUM}/comments" --paginate \
+            --jq "[.[] | select(.body | startswith(\"${MARKER}\"))] | .[0]")
+
+          if [ -z "$COMMENT_JSON" ] || [ "$COMMENT_JSON" = "null" ]; then
+            BODY=$(printf '%s\n### 🚀 Deployment status\n| Env | Tag | SHA | When |\n|-----|-----|-----|------|\n%s\n' "$MARKER" "$NEW_ROW")
+            gh pr comment "$PR_NUM" --body "$BODY"
+            echo "Created new deploy-status comment."
+            exit 0
+          fi
+
+          COMMENT_ID=$(echo "$COMMENT_JSON" | jq -r '.id')
+          OLD_BODY=$(echo "$COMMENT_JSON" | jq -r '.body')
+
+          # Strip any existing row for this env, then append the new row.
+          UPDATED=$(printf '%s\n' "$OLD_BODY" | awk -v env="$ENV" -v new="$NEW_ROW" '
+            BEGIN { added=0 }
+            /^\| *[a-zA-Z0-9_-]+ *\|/ {
+              # Match table rows; skip the header/separator and skip prior row for this env.
+              split($0, cells, "|")
+              cell_env = cells[2]
+              gsub(/^ +| +$/, "", cell_env)
+              if (cell_env == "Env" || cell_env ~ /^-+$/) { print; next }
+              if (cell_env == env) { next }
+              print
+              next
+            }
+            { print }
+            END { print new }
+          ')
+
+          gh api -X PATCH "repos/${REPO}/issues/comments/${COMMENT_ID}" -f body="$UPDATED" >/dev/null
+          echo "Updated existing deploy-status comment."
