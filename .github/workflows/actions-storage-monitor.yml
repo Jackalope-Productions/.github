@@ -1,0 +1,117 @@
+name: Actions Storage Monitor
+
+# Runs every Monday and reports org-wide active artifact storage.
+# Opens / comments on a tracking issue when usage exceeds a warning threshold.
+#
+# See ../actions-storage.md for the policy this monitor enforces.
+
+on:
+  schedule:
+    - cron: '0 14 * * 1'   # Mondays at 14:00 UTC (7:00 AM US/Pacific)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.STORAGE_MONITOR_TOKEN || secrets.GITHUB_TOKEN }}
+      ORG: ${{ github.repository_owner }}
+      WARN_GB: 25
+      URGENT_GB: 40
+      CEILING_GB: 50
+    steps:
+      - name: Aggregate active artifact bytes per repo
+        id: scan
+        run: |
+          set -euo pipefail
+
+          repos=$(gh api "orgs/$ORG/repos" --paginate -q '.[].name')
+
+          : > usage.tsv
+          for r in $repos; do
+            size=$(gh api "repos/$ORG/$r/actions/artifacts?per_page=100" --paginate \
+              -q '[.artifacts[] | select(.expired == false) | .size_in_bytes] | add // 0' \
+              2>/dev/null || echo 0)
+            if [ "$size" -gt 0 ]; then
+              printf '%s\t%s\n' "$r" "$size" >> usage.tsv
+            fi
+          done
+
+          total=$(awk -F'\t' '{s += $2} END {print s+0}' usage.tsv)
+          gb=$(awk "BEGIN {printf \"%.2f\", $total/1073741824}")
+
+          {
+            echo "# Actions Storage — $(date -u +%Y-%m-%d)"
+            echo
+            echo "**Total active: ${gb} GB**"
+            echo "(warn at ${WARN_GB} GB, urgent at ${URGENT_GB} GB, ceiling ${CEILING_GB} GB)"
+            echo
+            echo "| Repo | Size (GB) |"
+            echo "|---|---:|"
+            sort -k2 -rn -t $'\t' usage.tsv | head -20 | while IFS=$'\t' read -r repo bytes; do
+              repo_gb=$(awk "BEGIN {printf \"%.3f\", $bytes/1073741824}")
+              printf '| %s | %s |\n' "$repo" "$repo_gb"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "total_gb=$gb"       >> "$GITHUB_OUTPUT"
+          echo "total_bytes=$total" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "Weekly Actions storage check, $(date -u +%Y-%m-%d)."
+            echo
+            echo "**Total active artifact storage: ${gb} GB**"
+            echo "Thresholds: warn ≥ ${WARN_GB} GB · urgent ≥ ${URGENT_GB} GB · ceiling ${CEILING_GB} GB."
+            echo
+            echo "## Per-repo breakdown"
+            echo
+            echo "| Repo | Size (GB) |"
+            echo "|---|---:|"
+            sort -k2 -rn -t $'\t' usage.tsv | while IFS=$'\t' read -r repo bytes; do
+              repo_gb=$(awk "BEGIN {printf \"%.3f\", $bytes/1073741824}")
+              printf '| [%s](https://github.com/%s/%s/actions/artifacts) | %s |\n' "$repo" "$ORG" "$repo" "$repo_gb"
+            done
+            echo
+            echo "See [actions-storage.md](https://github.com/${ORG}/.github/blob/main/actions-storage.md) for the retention policy and remediation steps."
+          } > issue-body.md
+
+      - name: Open or update tracking issue
+        if: ${{ steps.scan.outputs.total_bytes != '' }}
+        env:
+          TOTAL_BYTES: ${{ steps.scan.outputs.total_bytes }}
+          TOTAL_GB:    ${{ steps.scan.outputs.total_gb }}
+        run: |
+          set -euo pipefail
+
+          warn_bytes=$((WARN_GB * 1073741824))
+          urgent_bytes=$((URGENT_GB * 1073741824))
+
+          if [ "$TOTAL_BYTES" -lt "$warn_bytes" ]; then
+            echo "Below warn threshold (${TOTAL_GB} < ${WARN_GB} GB) — no issue action."
+            exit 0
+          fi
+
+          title="Actions storage above ${WARN_GB} GB"
+          existing=$(gh issue list --repo "$ORG/.github" --search "$title in:title is:open" --json number -q '.[0].number' || echo "")
+
+          if [ -z "$existing" ]; then
+            issue_num=$(gh issue create --repo "$ORG/.github" \
+              --title "$title" \
+              --body-file issue-body.md \
+              --label actions-storage \
+              -q .number)
+            echo "Opened tracking issue #$issue_num"
+          else
+            gh issue comment "$existing" --repo "$ORG/.github" --body-file issue-body.md
+            issue_num=$existing
+            echo "Updated tracking issue #$issue_num"
+          fi
+
+          if [ "$TOTAL_BYTES" -ge "$urgent_bytes" ]; then
+            gh issue edit "$issue_num" --repo "$ORG/.github" --add-label urgent
+            echo "Above urgent threshold — added 'urgent' label."
+          fi
