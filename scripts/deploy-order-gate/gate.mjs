@@ -6,8 +6,10 @@ import { parseDeps, pickLatestEnvTag, isCarryOfPr, depKey, decide, prRefsFromSub
 const API = process.env.GITHUB_API_URL || 'https://api.github.com';
 const REPO = process.env.REPO;
 const [OWNER] = REPO.split('/');
-const OWN_TOKEN = process.env.GH_TOKEN;
-const READ_TOKEN = process.env.READ_TOKEN || OWN_TOKEN;
+// Secrets set through a PowerShell pipe can carry a BOM, which fetch rejects in a header.
+const clean = (t) => (t || '').replace(/^﻿/, '').trim();
+const OWN_TOKEN = clean(process.env.GH_TOKEN);
+const READ_TOKEN = clean(process.env.READ_TOKEN) || OWN_TOKEN;
 const CONTEXT = process.env.STATUS_CONTEXT || 'deploy-order';
 const RUN_URL = process.env.RUN_URL || '';
 const PR_NUMBER = process.env.PR_NUMBER ? Number(process.env.PR_NUMBER) : null;
