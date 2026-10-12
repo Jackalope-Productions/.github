@@ -1,0 +1,65 @@
+name: Deploy-order gate
+
+# Reusable workflow. Sets the `deploy-order` commit status on PRs into deploy branches:
+# failure while any `Depends-On-Deployed: <repo>#<n>` dependency (in the PR body, or in the
+# body of any merged PR whose commits this PR carries) is not yet in the latest
+# `<env>-*` deploy tag of its repo for the env this PR's base branch deploys to.
+# Spec + adoption: docs/deploy-order-gate.md in this repo.
+
+on:
+  workflow_call:
+    inputs:
+      branch_env_map:
+        description: 'JSON map of base branch -> env token the dependency must be deployed to, e.g. {"staging":"staging","main":"prod"}'
+        required: true
+        type: string
+      status_context:
+        description: Commit status context name (make this the required check).
+        required: false
+        type: string
+        default: deploy-order
+      gate_ref:
+        description: Ref of Jackalope-Productions/.github to load the gate script from (match the ref in uses:).
+        required: false
+        type: string
+        default: main
+    secrets:
+      read_token:
+        description: Token with read access to dependency repos. Same-repo dependencies use GITHUB_TOKEN.
+        required: false
+
+permissions:
+  contents: read
+  pull-requests: read
+  statuses: write
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: deploy-order-${{ github.repository }}-${{ github.event.pull_request.number || 'sweep' }}
+      cancel-in-progress: true
+    timeout-minutes: 10
+    steps:
+      - name: Checkout gate script
+        uses: actions/checkout@v4
+        with:
+          repository: Jackalope-Productions/.github
+          ref: ${{ inputs.gate_ref }}
+          sparse-checkout: scripts/deploy-order-gate
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Evaluate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          READ_TOKEN: ${{ secrets.read_token }}
+          REPO: ${{ github.repository }}
+          BRANCH_ENV_MAP: ${{ inputs.branch_env_map }}
+          STATUS_CONTEXT: ${{ inputs.status_context }}
+          PR_NUMBER: ${{ github.event.pull_request.number || '' }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: node scripts/deploy-order-gate/gate.mjs

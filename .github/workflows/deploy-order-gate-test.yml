@@ -1,0 +1,21 @@
+name: Deploy-order gate tests
+
+on:
+  pull_request:
+    paths:
+      - scripts/deploy-order-gate/**
+      - .github/workflows/deploy-order-gate*.yml
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: node --test scripts/deploy-order-gate/lib.test.mjs
